@@ -1,7 +1,11 @@
 <html>
 <body>
 <h1>WebSocket Demo</h1>
-<input id="message" type="text"/>
+<h3>Routing Key</h3>
+<input id="routing_key" type="text"/>
+<h3>Exchange</h3>
+<input id="exchange" type="text"/>
+<input type="submit" id="go"/>
 <section id="content"></section>
 <script src="http://www.google.com/jsapi"></script>
 <script>google.load("jquery", "1.3")</script>
@@ -12,10 +16,11 @@
 <script>
   var ws = $.websocket("ws://127.0.0.1:8080/websocket", {
     events: { 
-      upcased: function(e) { $("#content").html(e.message); }}});
+      event: function(e) { $("#content").append(e.message); }}});
 
-  $('#message').change(function(){
-    ws.send('message', {type: "downcase", message: $("#message").val()});});
+  $('#go').click(function(){
+	alert("sending");
+    ws.send('message', { exchange: $("#exchange").val(), routing_key: $("#routing_key").val()});});
 </script>
 </body>
 </html>

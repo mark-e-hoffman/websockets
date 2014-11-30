@@ -8,94 +8,87 @@
             [langohr.channel   :as lch]
             [langohr.queue     :as lq]
             [langohr.consumers :as lc]
-            [langohr.basic     :as lb]))
+	    [langohr.exchange  :as le]
+            [langohr.basic     :as lb])
+ (:gen-class))
 
 
 (def ^{:const true}
   default-exchange-name "")
 
 (def mq-map (atom {}))
-(def conn-map (ref {:uuid {} :conn {}}))
-(def req-queue-name "face.detection.request" )
-(def resp-queue-name "face.detection.response")
+(def conn-map (ref {}))
+(def queue-map (ref {}))
 
- (defn init-mq [ req-qname resp-qname ]
+(defn init-mq [exchange ]
 	(let [ cn (rmq/connect)
-	       c ( lch/open cn )]
-		(lq/declare c req-qname :exclusive false :auto-delete false)
-    (lq/declare c resp-qname :exclusive false :auto-delete false)
+		c ( lch/open cn )]
+		(le/declare c exchange "topic" {:durable false :auto-delete true})
 		{ :conn cn :ch c }))
 
+(defn get-channel []
+	(:ch @mq-map))
 
+(defn get-conn [ qname ]
+  (get (:conn @queue-map) qname ))
 
-(defn get-conn [ uuid ]
-  (get (:uuid @conn-map) uuid ))
+(defn get-qname [ conn ]
+  (:qname (get @conn-map) conn ))
 
-(defn get-uuid [ conn ]
-  (get (:conn @conn-map) conn ))
-
-
-(defn add-conn-uuid [ c uuid]
-  (println (str "addi ng connection " c " with uuid " uuid))
+(defn add-conn [ c ]
   (dosync
-    (ref-set conn-map (assoc-in @conn-map [:conn c ] uuid))
-    (ref-set conn-map (assoc-in @conn-map [:uuid uuid] c ))
+    (ref-set conn-map (assoc @conn-map c {}))
   ))
 
-(defn remove-conn-uuid [ c ]
-  (let [ uuid (get-uuid c) ]
-     (println (str "removing connection " c " with uuid " uuid))
+(defn add-conn-queue [ c qname ]
+  (dosync
+    (ref-set conn-map (assoc @conn-map c { :qname qname}))
+    (ref-set queue-map (assoc @queue-map qname  {:conn c }))))
+
+(defn remove-conn [ c ]
+  (let [ qname  (get-qname c) ]
+     (println (str "removing connection " c " with queue " qname ))
     (dosync
-      (ref-set conn-map (core/dissoc-in @conn-map [:conn c ]  ))
-      (ref-set conn-map (core/dissoc-in @conn-map [:uuid uuid] ))
-  )))
+      (ref-set conn-map dissoc @conn-map c )
+      (ref-set queue-map dissoc @queue-map qname ))))
 
-
-
-(defn send-message [ connection message ]
-	(println (str "conn:" connection " message:" message ))
-    (.send connection (json/json-str
-                       {:type "upcased" :message (s/upper-case message) })))
-(defn message-handler
-  [ch {:keys [content-type delivery-tag type] :as meta} ^bytes payload]
-  (comment (println (format "[consumer] Received a message: %s, delivery tag: %d, content type: %s, type: %s"
-                   (String. payload "UTF-8") delivery-tag content-type type)))
-	(let [ 	s (String. payload "UTF-8") 
-		m (json/read-json s) 
-		uuid (:uuid m )] 
-		(println (str "uuid in message:" uuid))
-		(send-message (get-conn uuid ) (str (:message m) " response"))))
+(defn send-message [ connection ^String message routing-key]
+    (.send connection (json/write-str {:type "event" :message message :routing_key routing-key})))
 
 (defn start-consumer
   "Starts a consumer in a separate thread"
-  [conn ch queue-name]
+  [conn ch queue-name handler]
   (let [thread (Thread. (fn []
-                          (lc/subscribe ch queue-name message-handler :auto-ack true)))]
+                          (lc/subscribe ch queue-name handler {:consumer-tag queue-name :auto-ack true})))]
     (.start thread)))
 
-(defn produce-message [ ch qname m ]
-	(lb/publish ch default-exchange-name qname m :content-type "application/javascript" :type "greetings.hi"))
-
-(defn on-message [connection json-message]
-  (let [message (-> json-message json/read-json (get-in [:data :message]))
-	uuid (get-uuid connection )]
-	(println (str "message:" message " with uuid:" uuid ))
-	(produce-message (:ch @mq-map) req-queue-name (json/json-str {:message message :uuid uuid}))))
+(defn on-message [connection json-message ]
+ (println json-message)
+  (let [jsdata  (json/read-str json-message :key-fn keyword)
+	exchange (get-in jsdata [:data :exchange] )
+	routing-key (get-in jsdata [:data :routing_key] )
+	ch ( get-channel ) ]
+ 		(let [ 	qname (lq/declare-server-named ch {:exclusive true}) 
+			my-handler (fn [ch meta ^bytes payload]   
+					(let [ s (String. payload "UTF-8") ]
+                				(send-message connection s (:routing-key meta)))) ]
+		(lq/bind ch qname exchange {:routing-key routing-key}) 
+		(add-conn-queue connection qname)
+		(start-consumer (:conn @mq-map) ch qname my-handler)))
+)
 
 (defn on-close [ c ]
-		(remove-conn-uuid c))
+	(remove-conn c))
 
 (defn on-open [ c ]
-
-    (add-conn-uuid c (str (java.util.UUID/randomUUID))))
+    (add-conn c ))
 
 (defn -main []
 
-	(let [ m (init-mq req-queue-name resp-queue-name )]
+	(let [ m (init-mq "my.exchange" )]
 		(swap! mq-map merge m)
 		(println "amqp client initialized"))
 		(println @mq-map)
-	(start-consumer (:conn @mq-map) (:ch @mq-map ) resp-queue-name )
 
   (doto (WebServers/createWebServer 8080)
     (.add "/websocket"
